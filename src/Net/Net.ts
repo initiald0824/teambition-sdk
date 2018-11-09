@@ -1,9 +1,8 @@
 import 'rxjs/add/observable/forkJoin'
 import 'rxjs/add/observable/of'
 import 'rxjs/add/operator/concatAll'
+import 'rxjs/add/operator/delayWhen'
 import 'rxjs/add/operator/do'
-import 'rxjs/add/operator/last'
-import 'rxjs/add/operator/mapTo'
 import 'rxjs/add/operator/mergeMap'
 import 'rxjs/add/operator/switchMap'
 import 'rxjs/add/operator/filter'
@@ -13,7 +12,7 @@ import { BehaviorSubject } from 'rxjs/BehaviorSubject'
 import { exhaustMap } from 'rxjs/operators/exhaustMap'
 import { QueryToken, SelectorMeta, ProxySelector } from 'reactivedb/proxy'
 import { JoinMode } from 'reactivedb/interface'
-import { Database, Query, Predicate, ExecutorResult } from 'reactivedb'
+import { Database, Query, Predicate } from 'reactivedb'
 
 import { forEach, isNonNullable, ParsedWSMsg, WSMsgToDBHandler, GeneralSchemaDef } from '../utils'
 import { SDKLogger } from '../utils/Logger'
@@ -143,8 +142,8 @@ const fieldsPred =
     }
   }
 
-const hasFields = <T>(datum: T, fields: Array<keyof T>) =>
-  fields.every((field) => typeof datum[field] !== 'undefined')
+const missingFieldsChecker = <T>(fields: Array<keyof T>) => (item: T) =>
+  fields.some((field) => typeof item[field] === 'undefined')
 
 export class Net {
   public fields = new Map<string, string[]>()
@@ -164,22 +163,18 @@ export class Net {
     if (!required || !padding || !pk) {
       fn = (stream$) => stream$ // pass through
     } else {
+      const hasMissingFields = missingFieldsChecker(required)
       fn = exhaustMap((resultSet) => {
-        if (!resultSet.length) {
-          return Observable.of(resultSet)
-        }
-        return Observable.from(resultSet)
-          .mergeMap((resultItem) => {
-            if (hasFields(resultItem, required)) {
-              return Observable.of(resultItem)
-            }
-            return padding(resultItem[pk])
+        const items = resultSet.filter(hasMissingFields)
+        const padding$ = Observable.from(items)
+          .mergeMap((item) => {
+            return padding(item[pk])
               .filter(isNonNullable)
-              .concatMap((resp) => this.database!.upsert(tableName, resp).mapTo(resp))
-              .do((resp) => Object.assign(resultItem, resp))
+              .delayWhen((resp) => this.database!.upsert(tableName, resp))
+              .do((resp) => Object.assign(item, resp))
           })
-          .last()
-          .mapTo(resultSet)
+        return Observable.of(resultSet)
+          .delayWhen(() => padding$.startWith(void 0).takeLast(1))
       })
     }
     fn.toString = () => 'SDK_VALIDATE'
@@ -241,24 +236,19 @@ export class Net {
     const database = this.database!
 
     const { request, method, tableName } = result as CUDApiResult<T>
-    let destination: Observable<ExecutorResult> | Observable<T | T[]>
-    return request
-      .concatMap(v => {
-        switch (method) {
-          case 'create':
-            destination = database.upsert<T>(tableName, v)
-            break
-          case 'update':
-            destination = database.upsert(tableName, v)
-            break
-          case 'delete':
-            destination = database.delete<T>(tableName, (result as UDResult<T>).clause)
-            break
-          default:
-            throw new Error()
-        }
-        return destination.mapTo<ExecutorResult | T | T[], T>(v)
-      })
+
+    return request.delayWhen((v) => {
+      switch (method) {
+        case 'create':
+          return database.upsert<T>(tableName, v)
+        case 'update':
+          return database.upsert(tableName, v)
+        case 'delete':
+          return database.delete<T>(tableName, (result as UDResult<T>).clause)
+        default:
+          throw new Error()
+      }
+    })
   }
 
   persist(database: Database) {
@@ -375,7 +365,7 @@ export class Net {
         if (!requestCache) {
           /*tslint:disable no-shadowed-variable*/
           const selector$ = response$
-            .concatMap(v => database.upsert(tableName, v))
+            .delayWhen((v) => database.upsert(tableName, v))
             .do(() => this.requestMap.set(cacheKey, true))
             .concatMap(() => dbGetWithSelfJoinEnabled<T>(database, tableName, q).selector$)
           token = new QueryToken(selector$)
@@ -386,7 +376,7 @@ export class Net {
         break
       case CacheStrategy.Cache:
         const selector$ = response$
-          .concatMap(v => database.upsert(tableName, v))
+          .delayWhen((v) => database.upsert(tableName, v))
           .concatMap(() => dbGetWithSelfJoinEnabled<T>(database, tableName, q).selector$)
         return new QueryToken(selector$)
       default:
